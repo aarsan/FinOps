@@ -1,0 +1,16 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Reports
+unattached-disks-report.csv
+unattached-disks-report.xlsx
+managed-disks-report.csv
+managed-disks-report.xlsx
+~$*.xlsx
+~$*.xls
+
+# Detailed billing exports (large; keep local only)
+data/
+Detail_BillingProfile_*.csv

@@ -1,0 +1,4 @@
+Name,ResourceGroup,SubscriptionId,Location,DiskState,SizeGB,Sku,Tier,Currency,CustomerMonthlyCost,ListMonthlyCost,MonthlySavings
+finops-test-p1-prem,rg-finops-unattached-test,edfeee88-1f3d-413a-b4d6-884d1f694077,eastus2,Unattached,4,Premium_LRS,P1,USD,0.47,0.6,0.13
+finops-test-e1-ssd,rg-finops-unattached-test,edfeee88-1f3d-413a-b4d6-884d1f694077,eastus2,Unattached,4,StandardSSD_LRS,E1,USD,0.24,0.3,0.06
+finops-test-s4-hdd,rg-finops-unattached-test,edfeee88-1f3d-413a-b4d6-884d1f694077,eastus2,Unattached,32,Standard_LRS,S4,,,,
