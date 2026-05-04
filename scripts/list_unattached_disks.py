@@ -3,9 +3,10 @@
 
 Inventory comes from Azure Resource Graph (a single KQL query across every
 subscription the signed-in account can read). Pricing comes from the customer's
-detailed billing CSV (Cost Management → 'Detail_BillingProfile_*.csv'),
-where `effectivePrice` is the negotiated unit rate and `payGPrice` is public
-list. The two are joined by (meterSubCategory, meterName, resourceLocation).
+detailed billing CSV. Two CSV formats are auto-detected:
+
+  * Legacy 'Detail_BillingProfile_*.csv' (EA / MCA usage detail)
+  * FOCUS export ('FocusCost' from Cost Management Exports v2)
 
 Default output: only disks currently in the Unattached state, with monthly
 cost, list price, and savings. The headline number is the total monthly
@@ -90,17 +91,60 @@ def _to_float(value: Optional[str]) -> Optional[float]:
         return None
 
 
+# Two billing CSV schemas are supported. Each schema names the columns we read.
+# Legacy: 'Detail_BillingProfile_*.csv' (a.k.a. EA / MCA usage detail)
+# FOCUS:  Cost Management 'FocusCost' export (FOCUS 1.0r2 + x_* extensions)
+LEGACY_SCHEMA = {
+    "name":            "legacy",
+    "category":        "meterCategory",
+    "subcategory":     "meterSubCategory",
+    "meter":           "meterName",
+    "region":          "resourceLocation",
+    "unit":            "unitOfMeasure",
+    "effective_price": "effectivePrice",
+    "list_price":      "payGPrice",
+    "currency":        "pricingCurrency",
+    "category_value":  "Storage",      # value the row's category column should equal
+    "unit_pattern":    re.compile(r"^\s*1\s*/\s*Month\s*$"),
+}
+FOCUS_SCHEMA = {
+    "name":            "FOCUS",
+    "category":        "ServiceCategory",
+    "subcategory":     "x_SkuMeterSubcategory",
+    "meter":           "x_SkuMeterName",
+    "region":          "RegionId",
+    "unit":            "PricingUnit",
+    "effective_price": "x_EffectiveUnitPrice",
+    "list_price":      "ListUnitPrice",
+    "currency":        "BillingCurrency",
+    "category_value":  "Compute",      # FOCUS classifies managed disks under Compute
+    "unit_pattern":    re.compile(r"^\s*Units?\s*/\s*Month\s*$|^\s*1\s*/\s*Month\s*$"),
+}
+
+
+def _detect_schema(fieldnames: list[str]) -> Optional[dict]:
+    """Pick the schema whose required columns are all present."""
+    for schema in (LEGACY_SCHEMA, FOCUS_SCHEMA):
+        cols = {schema[k] for k in (
+            "category", "subcategory", "meter", "region",
+            "unit", "effective_price", "list_price", "currency",
+        )}
+        if cols.issubset(fieldnames):
+            return schema
+    return None
+
+
 def build_price_index(path: Path) -> dict[tuple[str, str, str], PriceEntry]:
     """Two-stage parse of a (potentially multi-GB) detailed billing CSV.
 
     1. Stream the file line-by-line and keep only lines that contain both
        'Managed Disks' and ' Disk,' (cheap substring tests reject the 99%+
        of rows that are VMs, networking, etc. without parsing fields).
-    2. Run csv.DictReader over the small surviving subset to correctly
-       handle quoted fields (the `tags` JSON blob, etc.).
+    2. csv.DictReader over the small surviving subset; auto-detects whether
+       the file is a legacy 'Detail_BillingProfile_*' export or a FOCUS
+       export (FocusCost), and reads the appropriate columns.
 
-    Returns a dict keyed by (meterSubCategory, meterName, resourceLocation)
-    all lower-cased.
+    Returns a dict keyed by (meterSubCategory, meterName, region) lowercased.
     """
     size_mb = path.stat().st_size / (1024 * 1024)
     print(f"Loading customer pricing from '{path}' ({size_mb:,.1f} MB)...")
@@ -130,40 +174,52 @@ def build_price_index(path: Path) -> dict[tuple[str, str, str], PriceEntry]:
           f"{len(candidate_lines) - 1:,} candidates kept in {elapsed:.1f}s.")
 
     reader = csv.DictReader(candidate_lines)
-    required = [
-        "meterCategory", "meterSubCategory", "meterName", "resourceLocation",
-        "unitOfMeasure", "effectivePrice", "payGPrice", "pricingCurrency",
-    ]
-    missing = [c for c in required if c not in (reader.fieldnames or [])]
-    if missing:
-        raise RuntimeError(f"Usage CSV missing required columns: {missing}")
+    schema = _detect_schema(list(reader.fieldnames or []))
+    if schema is None:
+        raise RuntimeError(
+            "Usage CSV is neither a legacy 'Detail_BillingProfile_*' nor a "
+            "FOCUS export. Required columns not found.\n"
+            f"  Saw: {sorted(reader.fieldnames or [])[:10]}..."
+        )
+    print(f"  detected schema: {schema['name']}")
 
-    uom_re = re.compile(r"^\s*1\s*/\s*Month\s*$")
+    cat_col   = schema["category"]
+    sub_col   = schema["subcategory"]
+    meter_col = schema["meter"]
+    reg_col   = schema["region"]
+    unit_col  = schema["unit"]
+    eff_col   = schema["effective_price"]
+    list_col  = schema["list_price"]
+    cur_col   = schema["currency"]
+    cat_value = schema["category_value"]
+    unit_re   = schema["unit_pattern"]
+
     index: dict[tuple[str, str, str], PriceEntry] = {}
     matched = 0
 
     for row in reader:
-        if row["meterCategory"] != "Storage":
+        if row.get(cat_col) != cat_value:
             continue
-        sub = row["meterSubCategory"]
+        sub = row.get(sub_col) or ""
         if not sub.endswith("Managed Disks"):
             continue
-        meter = row["meterName"]
+        meter = row.get(meter_col) or ""
         if not meter.endswith(" Disk"):
             continue
-        if not uom_re.match(row["unitOfMeasure"]):
+        if not unit_re.match(row.get(unit_col) or ""):
             continue
 
         matched += 1
-        key = (sub.lower(), meter.lower(), row["resourceLocation"].lower())
+        region = (row.get(reg_col) or "").lower()
+        key = (sub.lower(), meter.lower(), region)
         existing = index.get(key)
         if existing is not None and existing.effective_price is not None:
             continue
 
         index[key] = PriceEntry(
-            effective_price=_to_float(row["effectivePrice"]),
-            payg_price=_to_float(row["payGPrice"]),
-            currency=row["pricingCurrency"],
+            effective_price=_to_float(row.get(eff_col)),
+            payg_price=_to_float(row.get(list_col)),
+            currency=row.get(cur_col) or "",
         )
 
     elapsed = time.perf_counter() - t0
@@ -270,19 +326,33 @@ def query_disks_via_resource_graph(
 # ---------- CSV utilities ----------
 
 def find_default_usage_csv(script_path: Path) -> Optional[Path]:
-    """Most-recent Detail_BillingProfile_*.csv in <workspace>/data/, then root."""
+    """Find the usage CSV under <workspace>/data/.
+
+    Resolution order:
+      1. The single *.csv file in data/, if there is exactly one.
+      2. The most recent Detail_BillingProfile_*.csv (legacy naming).
+      3. The most recent *.csv overall.
+    Returns None if data/ is missing or contains no CSVs.
+    """
     workspace = script_path.parent.parent
-    for search_dir in (workspace / "data", workspace):
-        if not search_dir.is_dir():
-            continue
-        candidates = sorted(
-            search_dir.glob("Detail_BillingProfile_*.csv"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if candidates:
-            return candidates[0]
-    return None
+    data_dir  = workspace / "data"
+    if not data_dir.is_dir():
+        return None
+
+    csvs = sorted(
+        data_dir.glob("*.csv"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not csvs:
+        return None
+    if len(csvs) == 1:
+        return csvs[0]
+
+    # Multiple CSVs: prefer Detail_BillingProfile_*.csv if present, otherwise
+    # the most recent file.
+    legacy = [p for p in csvs if p.name.startswith("Detail_BillingProfile_")]
+    return legacy[0] if legacy else csvs[0]
 
 
 # ---------- main ----------
@@ -291,9 +361,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--usage-csv",
-        help="Detailed billing profile CSV. Defaults to the most recent "
-             "Detail_BillingProfile_*.csv in <workspace>/data/, then in "
-             "the workspace root.",
+        help="Detailed billing CSV. If omitted, the script picks the single "
+             "CSV under <workspace>/data/ (or the most recent if there are "
+             "multiple).",
     )
     parser.add_argument(
         "--export-csv",
@@ -342,9 +412,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         found = find_default_usage_csv(script_path)
         if not found:
-            print("\nERROR: No usage CSV provided and no Detail_BillingProfile_*.csv "
-                  "found in <workspace>/data/ or the workspace root. "
-                  "Pass --usage-csv.", file=sys.stderr)
+            print("\nERROR: No usage CSV provided and no *.csv found in "
+                  "<workspace>/data/. Pass --usage-csv.", file=sys.stderr)
             return 2
         usage_csv = found.resolve()
         print(f"\nAuto-detected usage CSV: {usage_csv}")
