@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 
 # Reports
+reports/
 unattached-disks-report.csv
 unattached-disks-report.xlsx
 managed-disks-report.csv
