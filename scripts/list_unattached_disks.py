@@ -354,6 +354,100 @@ def query_disks_via_resource_graph(
     return all_rows
 
 
+# ---------- Disk → result-row construction ----------
+
+def build_disk_rows(
+    disks: list[dict],
+    price_index: dict[tuple[str, str, str], "PriceEntry"],
+) -> tuple[list[dict], int]:
+    """Marry Resource Graph disk inventory to the CSV-derived price index.
+
+    Returns (rows, no_price_count). 'no_price_count' is how many disks had no
+    matching CSV price (typically Premium SSD v2 / Ultra, or regions not in the
+    CSV's billing period).
+    """
+    rows: list[dict] = []
+    no_price = 0
+    for d in disks:
+        sku  = d.get("skuName") or ""
+        size = int(d.get("sizeGB") or 0)
+        loc  = (d.get("location") or "").lower()
+        tier_info = derive_tier(sku, size)
+
+        effective_price = payg_price = contracted_price = None
+        customer_monthly = list_monthly = monthly_savings = None
+        currency = ""
+        benefit = "List price"
+        benefit_discount_pct: Optional[float] = None
+        contract_discount_pct: Optional[float] = None
+        if tier_info.product and tier_info.meter:
+            entry = price_index.get(
+                (tier_info.product.lower(), tier_info.meter.lower(), loc)
+            )
+            if entry and entry.effective_price is not None:
+                effective_price  = round(entry.effective_price, 4)
+                customer_monthly = round(entry.effective_price, 2)
+                if entry.contracted_price is not None:
+                    contracted_price = round(entry.contracted_price, 4)
+                if entry.payg_price is not None:
+                    payg_price      = round(entry.payg_price, 4)
+                    list_monthly    = round(entry.payg_price, 2)
+                    monthly_savings = round(entry.payg_price - entry.effective_price, 2)
+                    if entry.payg_price > 0:
+                        contract_discount_pct = round(
+                            (entry.payg_price - (entry.contracted_price
+                                                 if entry.contracted_price is not None
+                                                 else entry.effective_price))
+                            / entry.payg_price * 100, 2
+                        )
+                currency = entry.currency
+
+                # Reason effective < list. Priority: explicit benefit > contracted > list.
+                if entry.benefit_name:
+                    btype = entry.benefit_type or entry.pricing_model or "Benefit"
+                    benefit = f"{btype}: {entry.benefit_name}"
+                    if (entry.payg_price and entry.payg_price > 0
+                            and entry.effective_price is not None):
+                        benefit_discount_pct = round(
+                            (entry.payg_price - entry.effective_price)
+                            / entry.payg_price * 100, 2
+                        )
+                elif (entry.contracted_price is not None and entry.payg_price is not None
+                      and entry.contracted_price < entry.payg_price - 1e-9):
+                    benefit = "MCA negotiated rate"
+                elif (entry.payg_price is not None
+                      and entry.effective_price < entry.payg_price - 1e-9):
+                    benefit = "Negotiated rate"
+                else:
+                    benefit = "List price"
+            else:
+                no_price += 1
+        else:
+            no_price += 1
+
+        rows.append({
+            "Name":                 d.get("name"),
+            "ResourceGroup":        d.get("resourceGroup"),
+            "SubscriptionId":       d.get("subscriptionId"),
+            "Location":             d.get("location"),
+            "DiskState":            d.get("diskState"),
+            "SizeGB":               size or None,
+            "Sku":                  sku or None,
+            "Tier":                 tier_info.tier,
+            "Currency":             currency or None,
+            "EffectivePrice":       effective_price,
+            "ContractedPrice":      contracted_price,
+            "PayGPrice":            payg_price,
+            "Benefit":              benefit,
+            "BenefitDiscountPct":   benefit_discount_pct,
+            "ContractDiscountPct":  contract_discount_pct,
+            "CustomerMonthlyCost":  customer_monthly,
+            "ListMonthlyCost":      list_monthly,
+            "MonthlySavings":       monthly_savings,
+        })
+    return (rows, no_price)
+
+
 # ---------- CSV utilities ----------
 
 def find_default_usage_csv(script_path: Path) -> Optional[Path]:
@@ -717,86 +811,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     price_index = build_price_index(usage_csv)
 
     # ----- 3. Marry inventory to pricing
-    results: list[dict] = []
-    no_price = 0
-    for d in disks:
-        sku  = d.get("skuName") or ""
-        size = int(d.get("sizeGB") or 0)
-        loc  = (d.get("location") or "").lower()
-        tier_info = derive_tier(sku, size)
-
-        effective_price = payg_price = contracted_price = None
-        customer_monthly = list_monthly = monthly_savings = None
-        currency = ""
-        benefit = "List price"
-        benefit_discount_pct: Optional[float] = None
-        contract_discount_pct: Optional[float] = None
-        if tier_info.product and tier_info.meter:
-            entry = price_index.get(
-                (tier_info.product.lower(), tier_info.meter.lower(), loc)
-            )
-            if entry and entry.effective_price is not None:
-                effective_price  = round(entry.effective_price, 4)
-                customer_monthly = round(entry.effective_price, 2)
-                if entry.contracted_price is not None:
-                    contracted_price = round(entry.contracted_price, 4)
-                if entry.payg_price is not None:
-                    payg_price      = round(entry.payg_price, 4)
-                    list_monthly    = round(entry.payg_price, 2)
-                    monthly_savings = round(entry.payg_price - entry.effective_price, 2)
-                    if entry.payg_price > 0:
-                        contract_discount_pct = round(
-                            (entry.payg_price - (entry.contracted_price
-                                                 if entry.contracted_price is not None
-                                                 else entry.effective_price))
-                            / entry.payg_price * 100, 2
-                        )
-                currency = entry.currency
-
-                # Reason effective < list. Priority: explicit benefit > contracted > list.
-                if entry.benefit_name:
-                    btype = entry.benefit_type or entry.pricing_model or "Benefit"
-                    benefit = f"{btype}: {entry.benefit_name}"
-                    if (entry.payg_price and entry.payg_price > 0
-                            and entry.effective_price is not None):
-                        benefit_discount_pct = round(
-                            (entry.payg_price - entry.effective_price)
-                            / entry.payg_price * 100, 2
-                        )
-                elif (entry.contracted_price is not None and entry.payg_price is not None
-                      and entry.contracted_price < entry.payg_price - 1e-9):
-                    benefit = "MCA negotiated rate"
-                elif (entry.payg_price is not None
-                      and entry.effective_price < entry.payg_price - 1e-9):
-                    # Some legacy exports leave unitPrice == payGPrice but discount lives in effectivePrice.
-                    benefit = "Negotiated rate"
-                else:
-                    benefit = "List price"
-            else:
-                no_price += 1
-        else:
-            no_price += 1
-
-        results.append({
-            "Name":                 d.get("name"),
-            "ResourceGroup":        d.get("resourceGroup"),
-            "SubscriptionId":       d.get("subscriptionId"),
-            "Location":             d.get("location"),
-            "DiskState":            d.get("diskState"),
-            "SizeGB":               size or None,
-            "Sku":                  sku or None,
-            "Tier":                 tier_info.tier,
-            "Currency":             currency or None,
-            "EffectivePrice":       effective_price,
-            "ContractedPrice":      contracted_price,
-            "PayGPrice":            payg_price,
-            "Benefit":              benefit,
-            "BenefitDiscountPct":   benefit_discount_pct,    # vs list, if a named benefit was applied
-            "ContractDiscountPct":  contract_discount_pct,   # vs list (sum of contract + benefit)
-            "CustomerMonthlyCost":  customer_monthly,
-            "ListMonthlyCost":      list_monthly,
-            "MonthlySavings":       monthly_savings,
-        })
+    results, no_price = build_disk_rows(disks, price_index)
 
     if no_price:
         print(f"\nNote: {no_price} disk(s) had no matching price in the CSV "

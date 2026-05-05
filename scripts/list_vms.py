@@ -520,6 +520,96 @@ def build_results(billing: dict[str, VmBilling]) -> list[dict]:
     return out
 
 
+# ---------- Insights / recommendations (callable from dashboard) ----------
+
+def compute_vm_by_category(results: list[dict]) -> dict[str, tuple[int, float]]:
+    """Group VMs by BenefitCategory: returns {category: (count, total_cost)}."""
+    out: dict[str, tuple[int, float]] = defaultdict(lambda: (0, 0.0))
+    for r in results:
+        cat = r["BenefitCategory"] or "Unknown"
+        n, c = out[cat]
+        out[cat] = (n + 1, c + (r["ActualCostInPeriod"] or 0))
+    return dict(out)
+
+
+def compute_observed_ri_discount(results: list[dict]) -> Optional[float]:
+    """Cost-weighted average RI discount derived from existing RI-covered VMs.
+    Returns 0.0–0.95 or None if no RI-covered VMs to learn from."""
+    ri_covered = [r for r in results
+                  if (r["BenefitCategory"] in ("Reservation", "Reservation (multiple)"))
+                  and r["EffectiveHourlyRate"] is not None
+                  and r["PayGHourlyRate"] is not None
+                  and r["PayGHourlyRate"] > 0]
+    if not ri_covered:
+        return None
+    weighted_sum = sum(
+        (1 - (r["EffectiveHourlyRate"] / r["PayGHourlyRate"]))
+        * (r["ActualCostInPeriod"] or 0)
+        for r in ri_covered
+    )
+    weight_total = sum(r["ActualCostInPeriod"] or 0 for r in ri_covered)
+    if weight_total <= 0:
+        return None
+    return max(0.0, min(0.95, weighted_sum / weight_total))
+
+
+def compute_ri_candidates(results: list[dict],
+                          observed_ri_discount: Optional[float],
+                          annualize: float) -> list[dict]:
+    """Group on-demand VMs by (VmSize, Location). Returns the meaningful
+    subset (always-on, or ≥ 1 month cumulative hours), sorted by projected
+    annual savings descending. Caps at 25 rows."""
+    candidate_vms = [r for r in results
+                     if r["BenefitCategory"] in ("MCA negotiated", "Negotiated", "List")
+                     and r["VmSize"]
+                     and (r["BillingHours"] or 0) > 0]
+    groups: dict[tuple[str, str], dict] = {}
+    for r in candidate_vms:
+        key = (r["VmSize"], r["Location"] or "")
+        agg = groups.setdefault(key, {
+            "VmSize":     r["VmSize"],
+            "Location":   r["Location"],
+            "VmCount":    0,
+            "TotalHours": 0.0,
+            "ActualCost": 0.0,
+            "ListCost":   0.0,
+            "Currency":   r["Currency"] or "",
+        })
+        agg["VmCount"]    += 1
+        agg["TotalHours"] += r["BillingHours"] or 0
+        agg["ActualCost"] += r["ActualCostInPeriod"] or 0
+        agg["ListCost"]   += r["ActualListInPeriod"] or 0
+
+    ALWAYS_ON_HOURS = 0.80 * HOURS_PER_MONTH
+    rows: list[dict] = []
+    for agg in groups.values():
+        hrs_per_vm = agg["TotalHours"] / max(agg["VmCount"], 1)
+        coverage = ("Always-on" if hrs_per_vm >= ALWAYS_ON_HOURS
+                    else "Mostly on" if hrs_per_vm >= 0.5 * HOURS_PER_MONTH
+                    else "Bursty / dev")
+        proj_period = (agg["ActualCost"] * observed_ri_discount) \
+            if observed_ri_discount is not None else None
+        proj_annual = proj_period * annualize if proj_period is not None else None
+        rows.append({
+            **agg,
+            "AvgHoursPerVm":          round(hrs_per_vm, 1),
+            "Coverage":               coverage,
+            "ProjectedSavingsPeriod": round(proj_period, 2) if proj_period is not None else None,
+            "ProjectedSavingsAnnual": round(proj_annual, 2) if proj_annual is not None else None,
+        })
+    rows.sort(key=lambda x: -(x.get("ProjectedSavingsAnnual") or x["ActualCost"]))
+    return [x for x in rows
+            if x["Coverage"] == "Always-on" or x["TotalHours"] >= HOURS_PER_MONTH][:25]
+
+
+def compute_ahb_vm_candidates(results: list[dict]) -> list[dict]:
+    """Per-VM list where Windows-license surcharge was billed (AHB not applied)."""
+    cands = [r for r in results
+             if r["AhbStatus"] == "No (Windows surcharge billed)"]
+    cands.sort(key=lambda r: -(r["WindowsSurchargeCost"] or 0))
+    return cands
+
+
 # ---------- CSV resolution ----------
 
 def find_default_usage_csv(script_path: Path) -> Optional[Path]:
@@ -617,11 +707,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"Run-rate monthly savings vs list            : {total_monthly_save:,.2f} {cur}/month")
 
     # Coarse breakdown by benefit category (for the headline summary).
-    by_category: dict[str, tuple[int, float]] = defaultdict(lambda: (0, 0.0))
-    for r in results:
-        cat = r["BenefitCategory"] or "Unknown"
-        n, c = by_category[cat]
-        by_category[cat] = (n + 1, c + (r["ActualCostInPeriod"] or 0))
+    by_category = compute_vm_by_category(results)
     if by_category:
         print("\nActual compute cost by benefit category:")
         for cat, (n, c) in sorted(by_category.items(), key=lambda kv: -kv[1][1]):
@@ -634,9 +720,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         by_benefit[r["Benefit"]] += r["ActualCostInPeriod"] or 0
 
     # AHB callout: VMs where a Windows surcharge was billed (i.e., AHB not used).
-    ahb_candidates = [r for r in results
-                      if r["AhbStatus"] == "No (Windows surcharge billed)"]
-    ahb_candidates.sort(key=lambda r: -(r["WindowsSurchargeCost"] or 0))
+    ahb_candidates = compute_ahb_vm_candidates(results)
     total_windows_candidates = sum(r["WindowsSurchargeCost"] or 0
                                    for r in ahb_candidates)
     if ahb_candidates:
@@ -654,79 +738,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"    ... and {len(ahb_candidates) - 10} more "
                   f"({remaining:,.2f} {cur})")
 
-    # ----- RI candidate analysis
-    # Customer's observed RI discount, derived from their own RI-covered VMs.
-    # Equivalent of: avg of (1 - effective/list) weighted by cost.
-    ri_covered = [r for r in results
-                  if (r["BenefitCategory"] in ("Reservation", "Reservation (multiple)"))
-                  and r["EffectiveHourlyRate"] is not None
-                  and r["PayGHourlyRate"] is not None
-                  and r["PayGHourlyRate"] > 0]
-    observed_ri_discount: Optional[float] = None
-    if ri_covered:
-        weighted_sum = sum(
-            (1 - (r["EffectiveHourlyRate"] / r["PayGHourlyRate"]))
-            * (r["ActualCostInPeriod"] or 0)
-            for r in ri_covered
-        )
-        weight_total = sum(r["ActualCostInPeriod"] or 0 for r in ri_covered)
-        if weight_total > 0:
-            observed_ri_discount = max(0.0, min(0.95, weighted_sum / weight_total))
-
-    # Group on-demand VMs (no benefit applied) by (VmSize, Location) — that's
-    # the natural unit for a Reservation purchase.
-    candidate_vms = [r for r in results
-                     if r["BenefitCategory"] in ("MCA negotiated", "Negotiated", "List")
-                     and r["VmSize"]
-                     and (r["BillingHours"] or 0) > 0]
-    ri_candidates: dict[tuple[str, str], dict] = {}
-    for r in candidate_vms:
-        key = (r["VmSize"], r["Location"] or "")
-        agg = ri_candidates.setdefault(key, {
-            "VmSize":            r["VmSize"],
-            "Location":          r["Location"],
-            "VmCount":           0,
-            "TotalHours":        0.0,
-            "ActualCost":        0.0,
-            "ListCost":          0.0,
-            "AvgEffectiveRate":  None,
-            "Currency":          r["Currency"] or "",
-        })
-        agg["VmCount"]    += 1
-        agg["TotalHours"] += r["BillingHours"] or 0
-        agg["ActualCost"] += r["ActualCostInPeriod"] or 0
-        agg["ListCost"]   += r["ActualListInPeriod"] or 0
-
-    # Score each candidate: high hours * cost = better RI fit. Threshold for
-    # "always-on": ≥ 80% of full-month hours (730 × 0.8 = 584).
-    ALWAYS_ON_HOURS = 0.80 * HOURS_PER_MONTH
-    ri_rows: list[dict] = []
-    for (sku, loc), agg in ri_candidates.items():
-        hrs_per_vm = agg["TotalHours"] / max(agg["VmCount"], 1)
-        coverage = "Always-on" if hrs_per_vm >= ALWAYS_ON_HOURS \
-                   else ("Mostly on" if hrs_per_vm >= 0.5 * HOURS_PER_MONTH
-                                    else "Bursty / dev")
-        proj_savings_period = (agg["ActualCost"] * observed_ri_discount) \
-            if observed_ri_discount is not None else None
-        proj_savings_annual = (proj_savings_period * annualize) \
-            if proj_savings_period is not None else None
-        ri_rows.append({
-            **agg,
-            "AvgHoursPerVm":           round(hrs_per_vm, 1),
-            "Coverage":                coverage,
-            "ProjectedSavingsPeriod":  round(proj_savings_period, 2)
-                                       if proj_savings_period is not None else None,
-            "ProjectedSavingsAnnual":  round(proj_savings_annual, 2)
-                                       if proj_savings_annual is not None else None,
-        })
-
-    # Sort by projected annual savings (more meaningful for buy decisions),
-    # fall back to actual cost.
-    ri_rows.sort(key=lambda x: -(x.get("ProjectedSavingsAnnual") or x["ActualCost"]))
-    # Promote only meaningful candidates: at least 1 always-on VM OR
-    # >= 1 month of cumulative hours (e.g. 4 VMs × 200h).
-    ri_top = [x for x in ri_rows
-              if x["Coverage"] == "Always-on" or x["TotalHours"] >= HOURS_PER_MONTH][:25]
+    # ----- RI candidate analysis (uses the customer's observed RI discount)
+    observed_ri_discount = compute_observed_ri_discount(results)
+    ri_top = compute_ri_candidates(results, observed_ri_discount, annualize)
 
     if observed_ri_discount is not None and ri_top:
         total_ann = sum(x.get("ProjectedSavingsAnnual") or 0 for x in ri_top)
