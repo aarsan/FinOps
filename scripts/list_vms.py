@@ -602,6 +602,60 @@ def compute_ri_candidates(results: list[dict],
             if x["Coverage"] == "Always-on" or x["TotalHours"] >= HOURS_PER_MONTH][:25]
 
 
+# Public reference rate for Azure Spot — typical 60-90% off list, region/SKU
+# dependent. We use 0.60 as a conservative defensible estimate so the
+# 'opportunity' number is realistic, not aspirational.
+SPOT_REFERENCE_DISCOUNT = 0.60
+
+
+def compute_spot_candidates(results: list[dict]) -> list[dict]:
+    """Group on-demand 'Bursty / dev' VMs (low avg hours/VM) by (VmSize, Location).
+
+    These are the natural Spot candidates: workloads that already run < 50% of
+    the period are typically dev/test or batch — fault-tolerant enough that
+    Spot evictions are tolerable. Always-on VMs are NOT Spot candidates (RI
+    or SP fits better).
+
+    Returns rows sorted by projected period savings descending. Caps at 25.
+    """
+    candidate_vms = [r for r in results
+                     if r["BenefitCategory"] in ("MCA negotiated", "Negotiated", "List")
+                     and r["VmSize"]
+                     and (r["BillingHours"] or 0) > 0]
+    groups: dict[tuple[str, str], dict] = {}
+    for r in candidate_vms:
+        key = (r["VmSize"], r["Location"] or "")
+        agg = groups.setdefault(key, {
+            "VmSize":     r["VmSize"],
+            "Location":   r["Location"],
+            "VmCount":    0,
+            "TotalHours": 0.0,
+            "ActualCost": 0.0,
+            "Currency":   r["Currency"] or "",
+        })
+        agg["VmCount"]    += 1
+        agg["TotalHours"] += r["BillingHours"] or 0
+        agg["ActualCost"] += r["ActualCostInPeriod"] or 0
+
+    BURSTY_HOURS_THRESHOLD = 0.50 * HOURS_PER_MONTH
+    rows: list[dict] = []
+    for agg in groups.values():
+        hrs_per_vm = agg["TotalHours"] / max(agg["VmCount"], 1)
+        if hrs_per_vm >= BURSTY_HOURS_THRESHOLD:
+            continue   # not bursty enough to qualify as Spot-friendly
+        proj_period = agg["ActualCost"] * SPOT_REFERENCE_DISCOUNT
+        rows.append({
+            **agg,
+            "AvgHoursPerVm":          round(hrs_per_vm, 1),
+            "Coverage":               "Bursty / dev",
+            "ProjectedSavingsPeriod": round(proj_period, 2),
+        })
+    rows.sort(key=lambda x: -(x["ProjectedSavingsPeriod"] or 0))
+    # Only return groups with at least 1 month of cumulative hours so we
+    # don't surface tiny one-off VMs.
+    return [x for x in rows if x["TotalHours"] >= HOURS_PER_MONTH][:25]
+
+
 def compute_ahb_vm_candidates(results: list[dict]) -> list[dict]:
     """Per-VM list where Windows-license surcharge was billed (AHB not applied)."""
     cands = [r for r in results

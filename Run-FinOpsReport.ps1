@@ -13,9 +13,11 @@
     -Disks      Unattached disks scan (Resource Graph + CSV pricing).
     -Vms        VM cost / benefit / RI-candidate report (CSV only).
     -Ahb        Azure Hybrid Benefit scan: who has it, who could (CSV only).
+    -Sql        SQL Server license + AHB scan across SQL on VM, Azure SQL
+                Database, and SQL Managed Instance (CSV only).
     -Extract    Decompress + concatenate a Cost Management export
                 (manifest.json + .csv.gz parts) into a single CSV under .\data\.
-    -All        Run Disks + Vms + Ahb in sequence (separate workbooks).
+    -All        Run Disks + Vms + Ahb + Sql in sequence (separate workbooks).
 
     Switches stack: '.\Run-FinOpsReport.ps1 -Vms -Ahb' runs both. Anything
     after the switches is forwarded verbatim to the underlying Python
@@ -52,6 +54,9 @@ param(
     [switch]$Ahb,
 
     [Parameter(ParameterSetName = 'Reports')]
+    [switch]$Sql,
+
+    [Parameter(ParameterSetName = 'Reports')]
     [switch]$Extract,
 
     [Parameter(ParameterSetName = 'Reports')]
@@ -70,16 +75,18 @@ if ($All) {
     $scripts.Add('list_unattached_disks.py')
     $scripts.Add('list_vms.py')
     $scripts.Add('list_ahb.py')
+    $scripts.Add('list_sql.py')
 } else {
     if ($Extract)   { $scripts.Add('extract_focus_export.py') }
     if ($Dashboard) { $scripts.Add('build_dashboard.py') }
     if ($Disks)     { $scripts.Add('list_unattached_disks.py') }
     if ($Vms)       { $scripts.Add('list_vms.py') }
     if ($Ahb)       { $scripts.Add('list_ahb.py') }
+    if ($Sql)       { $scripts.Add('list_sql.py') }
 }
 
 if ($scripts.Count -eq 0) {
-    Write-Host "No report selected. Use one or more of: -Dashboard, -Disks, -Vms, -Ahb, -Extract, -All" -ForegroundColor Yellow
+    Write-Host "No report selected. Use one or more of: -Dashboard, -Disks, -Vms, -Ahb, -Sql, -Extract, -All" -ForegroundColor Yellow
     Write-Host "Recommended: .\Run-FinOpsReport.ps1 -Dashboard"
     Get-Help $PSCommandPath -Examples
     exit 1
