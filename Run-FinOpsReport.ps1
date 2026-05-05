@@ -120,18 +120,29 @@ if (-not (Test-Path -LiteralPath $venvPy)) {
     }
 }
 
-# Probe the deps each script needs. The disk script needs azure-* packages;
-# the VM and AHB scripts only need openpyxl. We probe the union so a single
-# install covers all three.
-& $venvPy -c "import openpyxl, azure.identity, azure.mgmt.resourcegraph, azure.mgmt.subscription" 2>$null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "Installing Python dependencies..." -ForegroundColor Cyan
+# Sync deps whenever requirements.txt changes. We stamp the venv with the
+# SHA-256 of requirements.txt; if the file is missing, the stamp is stale,
+# or the hash differs, we (re)install. This catches newly-added packages
+# without relying on a hard-coded import probe.
+if (-not (Test-Path -LiteralPath $reqs)) {
+    Write-Error "Missing dependency manifest: $reqs"
+    exit 1
+}
+$stampFile  = Join-Path $venv '.requirements.sha256'
+$reqsHash   = (Get-FileHash -LiteralPath $reqs -Algorithm SHA256).Hash
+$stampHash  = if (Test-Path -LiteralPath $stampFile) {
+    (Get-Content -LiteralPath $stampFile -Raw -ErrorAction SilentlyContinue).Trim()
+} else { '' }
+
+if ($stampHash -ne $reqsHash) {
+    Write-Host "Installing Python dependencies from $([System.IO.Path]::GetFileName($reqs)) ..." -ForegroundColor Cyan
     & $venvPy -m pip install --upgrade pip --quiet
     & $venvPy -m pip install -r $reqs --quiet
     if ($LASTEXITCODE -ne 0) {
         Write-Error "pip install failed. See output above."
         exit 1
     }
+    Set-Content -LiteralPath $stampFile -Value $reqsHash -NoNewline
 }
 
 # ----- Run the requested scripts in order
